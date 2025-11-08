@@ -2,6 +2,7 @@
 
 Canvas::Canvas(QWidget *parent) : QWidget(parent) {
     setMouseTracking(true);
+    setFocusPolicy(Qt::StrongFocus);
 }
 
 void Canvas::setShapeType(ShapeType type) {
@@ -167,3 +168,14 @@ void Canvas::paintEvent(QPaintEvent *) {
         }
     }
 }
+
+void Canvas::keyPressEvent(QKeyEvent *event) {
+    if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
+        shapes.erase(
+            std::remove_if(shapes.begin(), shapes.end(),
+                           [](const Shape &s) { return s.selected; }),
+            shapes.end());
+        update();
+    }
+}
+
