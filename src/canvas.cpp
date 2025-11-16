@@ -2,6 +2,7 @@
 #include <QApplication>
 #include <algorithm>
 #include <QDebug>
+#include <QtMath> // Для qRound и qMax
 
 // Глобальные константы
 const int HANDLE_SIZE = 8;
@@ -13,16 +14,41 @@ const int CLICK_THRESHOLD = 5; // Порог "клика" (в пикселях)
 
 /**
  * @brief Конструктор класса Canvas.
- *
- * Инициализирует виджет, устанавливает отслеживание мыши
- * и политику фокуса для обработки событий.
- *
- * @param parent Родительский виджет (обычно nullptr).
  */
 Canvas::Canvas(QWidget *parent) : QWidget(parent) {
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
     setTool(Tool::Select); // Устанавливаем инструмент по умолчанию
+}
+
+/**
+ * @brief Устанавливает текущий тип фигуры для рисования.
+ */
+void Canvas::setShapeType(ShapeType type) {
+    currentShape = type;
+}
+
+/**
+ * @brief Устанавливает текущий активный инструмент.
+ */
+void Canvas::setTool(Tool tool) {
+    currentTool = tool;
+    updateCursorIcon(); // Обновляем курсор в соответствии с инструментом
+}
+
+/**
+ * @brief Включает или выключает отображение сетки.
+ */
+void Canvas::setGridEnabled(bool enabled) {
+    gridEnabled = enabled;
+    update(); // Запросить перерисовку, чтобы показать/скрыть сетку
+}
+
+/**
+ * @brief Включает или выключает привязку к сетке.
+ */
+void Canvas::setSnapEnabled(bool enabled) {
+    snapEnabled = enabled;
 }
 
 //==================================================================
@@ -31,17 +57,16 @@ Canvas::Canvas(QWidget *parent) : QWidget(parent) {
 
 /**
  * @brief Главная функция отрисовки.
- *
- * Вызывается Qt, когда виджету требуется перерисовка (по update()).
- * Рисует все фигуры, рамки выделения, ручки ресайза
- * и "призрачный" предпросмотр.
- *
- * @param e Событие отрисовки (не используется).
  */
 void Canvas::paintEvent(QPaintEvent *e) {
     QPainter p(this);
     p.fillRect(rect(), Qt::white);
     p.setRenderHint(QPainter::Antialiasing);
+
+    // 0. РИСУЕМ СЕТКУ (самый нижний слой)
+    if (gridEnabled) {
+        drawGrid(&p);
+    }
 
     // 1. РИСУЕМ ВСЕ ФИГУРЫ
     for (const auto &s : shapes) {
@@ -54,19 +79,27 @@ void Canvas::paintEvent(QPaintEvent *e) {
     }
 
     // 2. РИСУЕМ ВЫДЕЛЕНИЕ И РУЧКИ
-    if (currentTool == Tool::Select) {
+    // Рисуем выделение если: активен инструмент выделения, идет moving/resizing,
+    // ИЛИ есть хотя бы одна выделенная фигура
+    bool hasSelection = std::any_of(shapes.begin(), shapes.end(),
+                                    [](const Shape& s) { return s.selected; });
+
+    if (currentTool == Tool::Select || moving || resizing || hasSelection) {
         QPen selectionPen(Qt::blue, 1, Qt::DashLine);
         QBrush handleBrush(Qt::blue);
         for (const auto &s : shapes) {
             if (!s.selected) continue;
-            p.setPen(selectionPen); p.setBrush(Qt::NoBrush);
             QRectF b = s.bounds();
-            p.drawRect(b.adjusted(-3, -3, 3, 3));
 
-            p.setPen(Qt::NoPen); p.setBrush(handleBrush);
+            p.setPen(selectionPen);
+            p.setBrush(Qt::NoBrush);
+            p.drawRect(b.adjusted(-3, -3, 3, 3)); // Рамка выделения
+
+            p.setPen(Qt::NoPen);
+            p.setBrush(handleBrush);
             auto handles = getResizeHandles(s);
             for (const QRectF& handleRect : handles.values()) {
-                p.drawRect(handleRect);
+                p.drawRect(handleRect); // Ручки ресайза
             }
         }
     }
@@ -74,38 +107,41 @@ void Canvas::paintEvent(QPaintEvent *e) {
     // 3. РИСУЕМ ПРЕДПРОСМОТР РИСОВАНИЯ
     if (drawing) {
         p.setPen(QPen(Qt::gray, 1, Qt::DashLine)); p.setBrush(Qt::NoBrush);
-        QRect r(startPoint, lastMousePos);
-        switch (currentShape) {
-        case ShapeType::Line: p.drawLine(startPoint, lastMousePos); break;
-        case ShapeType::Rectangle: p.drawRect(r); break;
-        case ShapeType::Circle: p.drawEllipse(r); break;
+
+        QPoint snappedLastPos = snapToGrid(lastMousePos);
+
+        // Используем хелпер для Shift/Ctrl
+        QRect r = calculateRect(startPoint, snappedLastPos);
+
+        if (currentShape == ShapeType::Line) {
+            p.drawLine(startPoint, snappedLastPos);
+        } else if (currentShape == ShapeType::Rectangle) {
+            p.drawRect(r); // Рисуем прямоугольник с учетом Shift/Ctrl
+        } else if (currentShape == ShapeType::Circle) {
+            p.drawEllipse(r); // Рисуем эллипс/круг с учетом Shift/Ctrl
         }
     }
 
     // 4. РИСУЕМ ПРЯМОУГОЛЬНИК ВЫДЕЛЕНИЯ
     if (selecting) {
         p.setPen(QPen(Qt::blue, 1, Qt::DashLine));
-        p.setBrush(QColor(0, 0, 255, 30)); // Полупрозрачный синий
+        p.setBrush(QColor(0, 0, 255, 30));
         p.drawRect(selectionRect);
     }
 }
 
 /**
  * @brief Обрабатывает нажатие кнопки мыши.
- *
- * "Главный диспетчер" - решает, какое действие (рисование,
- * перемещение, ресайз, выделение) начинается.
- *
- * @param event Событие мыши, содержит позицию и кнопки.
  */
 void Canvas::mousePressEvent(QMouseEvent *event) {
     if (event->button() != Qt::LeftButton)
         return;
 
-    lastMousePos = event->pos();
+    lastMousePos = event->pos(); // Сохраняем *реальную* позицию
+    QPoint snappedPos = snapToGrid(event->pos()); // Используем *привязанную*
 
     if (currentTool == Tool::Select) {
-        // Приоритет 1: Нажали на ручку ресайза?
+        // Логика Tool::Select (без изменений)
         auto [handleShape, handlePos] = getHandleAt(event->pos());
         if (handleShape != nullptr) {
             resizing = true;
@@ -124,12 +160,11 @@ void Canvas::mousePressEvent(QMouseEvent *event) {
             return;
         }
 
-        // Приоритет 2: Нажали на фигуру? (Перемещение / Выделение)
         Shape* s = shapeAt(event->pos());
         if (s) {
             moving = true;
             if (event->modifiers() & Qt::ShiftModifier) {
-                s->selected = !s->selected; // Инвертируем
+                s->selected = !s->selected;
             } else if (!s->selected) {
                 for (auto &shape : shapes) shape.selected = false;
                 s->selected = true;
@@ -138,10 +173,8 @@ void Canvas::mousePressEvent(QMouseEvent *event) {
             return;
         }
 
-        // Приоритет 3: Нажали на пустое место? (Прямоугольное выделение)
         selecting = true;
-        selectionRect = QRect(event->pos(), QSize(0, 0));
-        // Сбрасываем выделение, если только не зажат Shift
+        selectionRect = QRect(snappedPos, QSize(0, 0));
         if (!(event->modifiers() & Qt::ShiftModifier)) {
             for (auto &shape : shapes) shape.selected = false;
         }
@@ -149,37 +182,80 @@ void Canvas::mousePressEvent(QMouseEvent *event) {
         return;
 
     } else if (currentTool == Tool::Draw) {
-        // Приоритет 1: Рисование
-        drawing = true;
-        startPoint = event->pos();
-        // Сбрасываем выделение
-        for (auto &shape : shapes) shape.selected = false;
-        update();
-        return;
+        // СНАЧАЛА проверяем ручки ресайза
+        auto [handleShape, handlePos] = getHandleAt(event->pos());
+        if (handleShape != nullptr) {
+            resizing = true;
+            resizingShape = handleShape;
+            currentResizeHandle = handlePos;
+            originalShapes.clear();
+            for (auto& s : shapes) {
+                if (s.selected) {
+                    s.originalRect = s.rect;
+                    s.originalStart = s.start;
+                    s.originalEnd = s.end;
+                    originalShapes.push_back(s);
+                }
+            }
+            update();
+            return;
+        }
+
+        // Затем проверяем, не попали ли в фигуру
+        Shape* s = shapeAt(event->pos());
+        if (s) {
+            // Попали в фигуру: выделяем ее (как Tool::Select)
+            if (event->modifiers() & Qt::ShiftModifier) {
+                s->selected = !s->selected;
+            } else if (!s->selected) {
+                for (auto &shape : shapes) shape.selected = false;
+                s->selected = true;
+            }
+
+            // Явно сбрасываем drawing и включаем moving
+            drawing = false;
+            moving = true;
+
+            update();
+            return;
+
+        } else {
+            // Попали в пустое место: начинаем рисование
+            drawing = true;
+            moving = false;
+            startPoint = snappedPos;
+            for (auto &shape : shapes) shape.selected = false;
+            update();
+            return;
+        }
     }
 }
 
 /**
  * @brief Обрабатывает движение мыши.
- *
- * Вызывается, когда мышь движется. Обновляет состояние
- * в зависимости от текущего действия (resizing, moving, etc.)
- *
- * @param event Событие мыши.
  */
 void Canvas::mouseMoveEvent(QMouseEvent *event) {
-    // Рассчитываем смещение с прошлого кадра
-    QPoint delta = event->pos() - lastMousePos;
+    QPoint snappedPos = snapToGrid(event->pos());
+
+    QPoint delta;
+    if (moving || resizing) { // Перемещение и ресайз всегда привязаны
+        delta = snappedPos - snapToGrid(lastMousePos);
+    } else {
+        delta = event->pos() - lastMousePos;
+    }
+
     lastMousePos = event->pos();
 
     // 1. РЕСАЙЗ
     if (resizing) {
-        applyResize(event->pos(), event->modifiers());
+        applyResize(snappedPos, event->modifiers());
         return;
     }
 
     // 2. ПЕРЕМЕЩЕНИЕ
     if (moving) {
+        if (delta.isNull()) return;
+
         for (auto &s : shapes) {
             if (!s.selected) continue;
             if (s.type == ShapeType::Line) {
@@ -194,8 +270,7 @@ void Canvas::mouseMoveEvent(QMouseEvent *event) {
 
     // 3. ПРЯМОУГОЛЬНОЕ ВЫДЕЛЕНИЕ
     if (selecting) {
-        // Обновляем геометрию прямоугольника выделения
-        selectionRect.setBottomRight(event->pos());
+        selectionRect.setBottomRight(snappedPos); // Обновляем привязанным
         update();
         return;
     }
@@ -212,14 +287,12 @@ void Canvas::mouseMoveEvent(QMouseEvent *event) {
 
 /**
  * @brief Обрабатывает отпускание кнопки мыши.
- *
- * Завершает текущее действие (resizing, moving, drawing, selecting).
- *
- * @param event Событие мыши.
  */
 void Canvas::mouseReleaseEvent(QMouseEvent *event) {
     if (event->button() != Qt::LeftButton)
         return;
+
+    QPoint snappedPos = snapToGrid(event->pos());
 
     // 1. ЗАВЕРШЕНИЕ РЕСАЙЗА
     if (resizing) {
@@ -227,46 +300,60 @@ void Canvas::mouseReleaseEvent(QMouseEvent *event) {
         resizingShape = nullptr;
         currentResizeHandle = HandlePosition::None;
         originalShapes.clear();
+        update();
+        updateCursorIcon(event->pos());
+        return;
     }
 
-    // 2. ЗАВЕРШЕНИЕ ПРЯМОУГОЛЬНОГО ВЫДЕЛЕНИЯ
+    // 2. ЗАВЕРШЕНИЕ ПЕРЕМЕЩЕНИЯ
+    // ВАЖНО: обрабатываем ПЕРЕД рисованием и выделением!
+    if (moving) {
+        moving = false;
+        // НЕ сбрасываем выделение - фигура остается выделенной
+        update();
+        updateCursorIcon(event->pos());
+        return;
+    }
+
+    // 3. ЗАВЕРШЕНИЕ ПРЯМОУГОЛЬНОГО ВЫДЕЛЕНИЯ
     if (selecting) {
         selecting = false;
-        QRect selRect = selectionRect.normalized(); // "Нормализуем" прямоугольник
-
-        // Выделяем все фигуры, чьи *габариты* полностью
-        // попадают внутрь прямоугольника выделения.
+        QRect selRect = selectionRect.normalized();
         for(auto& s : shapes) {
             if (selRect.contains(s.bounds().toRect())) {
                 s.selected = true;
             }
         }
+        update();
+        updateCursorIcon(event->pos());
+        return;
     }
 
-    // 3. ЗАВЕРШЕНИЕ РИСОВАНИЯ
+    // 4. ЗАВЕРШЕНИЕ РИСОВАНИЯ
     if (drawing) {
         drawing = false;
+        QPoint endPoint = snappedPos;
 
-        int manhattan = (startPoint - event->pos()).manhattanLength();
-        bool isClick = (manhattan <= CLICK_THRESHOLD);
+        int manhattan = (startPoint - endPoint).manhattanLength();
+        bool isClick = (manhattan < CLICK_THRESHOLD);
 
         if (!isClick) {
-            // Это был "дрэг" - создаем фигуру
             if (currentShape == ShapeType::Line) {
-                shapes.push_back({currentShape, QRect(), startPoint, event->pos(), true});
+                shapes.push_back({currentShape, QRect(), startPoint, endPoint, true});
             } else {
-                QRect r(startPoint, event->pos());
-                shapes.push_back({currentShape, r.normalized(), {}, {}, true});
+                QRect r = calculateRect(startPoint, endPoint);
+                shapes.push_back({currentShape, r, {}, {}, true});
             }
-            // Выделяем только что созданную фигуру
+
+            // выделяем созданную фигуру
+            for (auto &s : shapes) s.selected = false;
             if (!shapes.empty()) shapes.back().selected = true;
         }
-        // Если был "клик" (isClick == true), ничего не делаем.
-    }
+        // Убрали обработку короткого клика - она не нужна, т.к. moving уже обработан выше
 
-    // 4. ЗАВЕРШЕНИЕ ПЕРЕМЕЩЕНИЯ
-    if (moving) {
-        moving = false;
+        update();
+        updateCursorIcon(event->pos());
+        return;
     }
 
     update();
@@ -275,14 +362,10 @@ void Canvas::mouseReleaseEvent(QMouseEvent *event) {
 
 /**
  * @brief Обрабатывает нажатие клавиш.
- *
- * Используется для удаления выделенных фигур.
- *
- * @param event Событие клавиатуры.
  */
 void Canvas::keyPressEvent(QKeyEvent *event) {
     if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
-        // Идиома erase-remove для удаления всех s.selected == true
+        // Удаляем все выделенные фигуры
         shapes.erase(
             std::remove_if(shapes.begin(), shapes.end(),
                            [](const Shape &s) { return s.selected; }),
@@ -299,13 +382,6 @@ void Canvas::keyPressEvent(QKeyEvent *event) {
 
 /**
  * @brief Применяет логику ресайза ко всем выделенным фигурам.
- *
- * Это "мозг" ресайза. Вычисляет коэффициенты масштабирования
- * на основе "главной" фигуры (resizingShape) и применяет их
- * ко всем остальным выделенным фигурам пропорционально.
- *
- * @param mousePos Текущая позиция мыши.
- * @param modifiers Зажатые клавиши (Shift, Ctrl).
  */
 void Canvas::applyResize(const QPoint &mousePos, Qt::KeyboardModifiers modifiers) {
     bool keepProportions = modifiers & Qt::ShiftModifier; bool fromCenter = modifiers & Qt::ControlModifier;
@@ -323,15 +399,15 @@ void Canvas::applyResize(const QPoint &mousePos, Qt::KeyboardModifiers modifiers
     } else {
         QRectF origRect = primaryOriginal.bounds(); primaryAnchor = getAnchorPoint(origRect, currentResizeHandle, fromCenter);
         switch(currentResizeHandle) {
-        case HandlePosition::TopLeft:     origHandlePos = origRect.topLeft(); break;
-        case HandlePosition::Top:         origHandlePos = QPointF(origRect.center().x(), origRect.top()); break;
-        case HandlePosition::TopRight:    origHandlePos = origRect.topRight(); break;
-        case HandlePosition::Left:        origHandlePos = QPointF(origRect.left(), origRect.center().y()); break;
-        case HandlePosition::Right:       origHandlePos = QPointF(origRect.right(), origRect.center().y()); break;
-        case HandlePosition::BottomLeft:  origHandlePos = origRect.bottomLeft(); break;
-        case HandlePosition::Bottom:      origHandlePos = QPointF(origRect.center().x(), origRect.bottom()); break;
-        case HandlePosition::BottomRight: origHandlePos = origRect.bottomRight(); break;
-        default:                          origHandlePos = primaryAnchor;
+        case HandlePosition::TopLeft:       origHandlePos = origRect.topLeft(); break;
+        case HandlePosition::Top:           origHandlePos = QPointF(origRect.center().x(), origRect.top()); break;
+        case HandlePosition::TopRight:      origHandlePos = origRect.topRight(); break;
+        case HandlePosition::Left:          origHandlePos = QPointF(origRect.left(), origRect.center().y()); break;
+        case HandlePosition::Right:         origHandlePos = QPointF(origRect.right(), origRect.center().y()); break;
+        case HandlePosition::BottomLeft:    origHandlePos = origRect.bottomLeft(); break;
+        case HandlePosition::Bottom:        origHandlePos = QPointF(origRect.center().x(), origRect.bottom()); break;
+        case HandlePosition::BottomRight:   origHandlePos = origRect.bottomRight(); break;
+        default:                            origHandlePos = primaryAnchor;
         }
         origVector = origHandlePos - primaryAnchor;
     }
@@ -389,38 +465,24 @@ void Canvas::applyResize(const QPoint &mousePos, Qt::KeyboardModifiers modifiers
 
 /**
  * @brief Вычисляет "якорную" точку для ресайза.
- *
- * Якорь - это неподвижная точка при ресайзе.
- * (Напр., при Ctrl - центр, при тяге за TopLeft - BottomRight).
- *
- * @param rect Габариты фигуры.
- * @param handle Ручка, за которую тянут.
- * @param fromCenter Зажат ли Ctrl (масштабировать от центра).
- * @return QPointF Координата якорной точки.
  */
 QPointF Canvas::getAnchorPoint(const QRectF& rect, HandlePosition handle, bool fromCenter) {
     if (fromCenter) return rect.center();
     switch (handle) {
-    case HandlePosition::TopLeft:     return rect.bottomRight();
-    case HandlePosition::Top:         return QPointF(rect.center().x(), rect.bottom());
-    case HandlePosition::TopRight:    return rect.bottomLeft();
-    case HandlePosition::Left:        return QPointF(rect.right(), rect.center().y());
-    case HandlePosition::Right:       return QPointF(rect.left(), rect.center().y());
-    case HandlePosition::BottomLeft:  return rect.topRight();
-    case HandlePosition::Bottom:      return QPointF(rect.center().x(), rect.top());
-    case HandlePosition::BottomRight: return rect.topLeft();
-    default:                          return rect.center();
+    case HandlePosition::TopLeft:       return rect.bottomRight();
+    case HandlePosition::Top:           return QPointF(rect.center().x(), rect.bottom());
+    case HandlePosition::TopRight:      return rect.bottomLeft();
+    case HandlePosition::Left:          return QPointF(rect.right(), rect.center().y());
+    case HandlePosition::Right:         return QPointF(rect.left(), rect.center().y());
+    case HandlePosition::BottomLeft:    return rect.topRight();
+    case HandlePosition::Bottom:        return QPointF(rect.center().x(), rect.top());
+    case HandlePosition::BottomRight:   return rect.topLeft();
+    default:                            return rect.center();
     }
 }
 
 /**
  * @brief Масштабирует точку 'p' относительно якоря 'anchor'.
- *
- * @param p Точка для масштабирования.
- * @param anchor Якорная точка (центр трансформации).
- * @param sx Коэффициент масштабирования по X.
- * @param sy Коэффициент масштабирования по Y.
- * @return QPointF Новая, масштабированная точка.
  */
 QPointF Canvas::scalePoint(const QPointF &p, const QPointF &anchor, qreal sx, qreal sy) {
     return QPointF(
@@ -429,28 +491,73 @@ QPointF Canvas::scalePoint(const QPointF &p, const QPointF &anchor, qreal sx, qr
         );
 }
 
+/**
+ * @brief Вычисляет геометрию QRect на основе двух точек и модификаторов.
+ *
+ * Учитывает Shift (для квадратов) и Ctrl (для рисования от центра).
+ *
+ * @param p1 Первая точка (обычно startPoint).
+ * @param p2 Вторая точка (обычно позиция мыши).
+ * @return QRect Вычисленный прямоугольник.
+ */
+QRect Canvas::calculateRect(const QPoint& p1, const QPoint& p2) const {
+    bool shift = QApplication::keyboardModifiers() & Qt::ShiftModifier;
+    bool ctrl = QApplication::keyboardModifiers() & Qt::ControlModifier;
+
+    QRect r;
+
+    if (ctrl) {
+        // Ctrl: Рисование от центра (p1 - центр)
+        int w = qAbs(p2.x() - p1.x()) * 2;
+        int h = qAbs(p2.y() - p1.y()) * 2;
+        if (shift) {
+            w = h = qMax(w, h); // Ctrl + Shift = квадрат от центра
+        }
+        r = QRect(p1.x() - w/2, p1.y() - h/2, w, h);
+    } else if (shift) {
+        // Shift: Квадрат (p1 - угол)
+        int w = p2.x() - p1.x();
+        int h = p2.y() - p1.y();
+        int size = qMax(qAbs(w), qAbs(h));
+
+        // Сохраняем направление (квадрант)
+        r = QRect(p1.x(), p1.y(),
+                  (w < 0) ? -size : size,
+                  (h < 0) ? -size : size);
+    } else {
+        // Свободное рисование
+        r = QRect(p1, p2);
+    }
+
+    return r.normalized(); // Всегда возвращаем L-T < R-B
+}
+
 // --- Логика Определения (Hit-testing) ---
 
 /**
  * @brief Находит фигуру в указанной позиции.
- *
- * Ищет в обратном порядке (сверху вниз).
- *
- * @param pos Позиция курсора мыши.
- * @return Shape* Указатель на найденную фигуру или nullptr.
  */
 Shape* Canvas::shapeAt(const QPoint &pos) {
+    // Ищем от конца к началу, чтобы приоритет был у верхних фигур
     for (auto it = shapes.rbegin(); it != shapes.rend(); ++it) {
         Shape &s = *it;
         if (s.type == ShapeType::Line) {
+            // Проверка для линии: ищем ближайшую точку на отрезке
             QLineF line(s.start, s.end);
             if (line.length() == 0) continue;
+
             QPointF p = pos; QPointF a = line.p1(); QPointF b = line.p2(); QPointF ab = b - a;
             QPointF ap = p - a; qreal t = QPointF::dotProduct(ap, ab) / QPointF::dotProduct(ab, ab);
-            t = qBound(0.0, t, 1.0); QPointF closest = a + t * ab;
+
+            t = qBound(0.0, t, 1.0); // Ограничиваем t от 0 до 1 (точка должна быть на отрезке)
+            QPointF closest = a + t * ab;
+
             qreal distance = QLineF(p, closest).length();
-            if (distance < 5) return &s;
+            if (distance < 5) return &s; // Порог 5 пикселей
+
         } else {
+            // Проверка для прямоугольника/круга: попадание в область
+            // Даем небольшой отступ (-2, 2) для удобства
             if (s.rect.adjusted(-2, -2, 2, 2).contains(pos)) return &s;
         }
     }
@@ -459,16 +566,11 @@ Shape* Canvas::shapeAt(const QPoint &pos) {
 
 /**
  * @brief Находит ручку ресайза в указанной позиции.
- *
- * Ищет ручки только у выделенных фигур.
- *
- * @param pos Позиция курсора мыши.
- * @return std::pair<Shape*, HandlePosition> Пара (Указатель на фигуру, Тип ручки) или {nullptr, None}.
  */
 std::pair<Shape*, HandlePosition> Canvas::getHandleAt(const QPoint &pos) {
-    if (currentTool != Tool::Select) {
-        return {nullptr, HandlePosition::None};
-    }
+    // if (currentTool != Tool::Select) {
+    //     return {nullptr, HandlePosition::None};
+    // }
     for (auto& s : shapes) {
         if (!s.selected) continue;
         auto handles = getResizeHandles(s);
@@ -483,9 +585,6 @@ std::pair<Shape*, HandlePosition> Canvas::getHandleAt(const QPoint &pos) {
 
 /**
  * @brief Вычисляет геометрию ручек ресайза для фигуры.
- *
- * @param s Фигура, для которой нужны ручки.
- * @return QMap<HandlePosition, QRectF> Словарь (Тип ручки -> Геометрия ручки).
  */
 QMap<HandlePosition, QRectF> Canvas::getResizeHandles(const Shape &s) const {
     QMap<HandlePosition, QRectF> handles; qreal h = HANDLE_SIZE; qreal h2 = h / 2.0;
@@ -510,24 +609,15 @@ QMap<HandlePosition, QRectF> Canvas::getResizeHandles(const Shape &s) const {
 
 /**
  * @brief Обновляет иконку курсора.
- *
- * Меняет курсор в зависимости от инструмента и того,
- * над чем находится мышь (ручка, фигура, пустое место).
- *
- * @param pos Текущая позиция мыши.
  */
 void Canvas::updateCursorIcon(const QPoint &pos) {
-    if (currentTool == Tool::Draw) {
-        setCursor(Qt::CrossCursor);
-        return;
-    }
-
-    // (currentTool == Tool::Select)
+    // Сначала проверяем режим перемещения
     if (moving) {
         setCursor(Qt::SizeAllCursor);
         return;
     }
 
+    // Проверяем ручки ресайза (независимо от инструмента)
     auto [handleShape, handlePos] = getHandleAt(pos);
     if (handleShape) {
         switch (handlePos) {
@@ -542,10 +632,55 @@ void Canvas::updateCursorIcon(const QPoint &pos) {
             setCursor(Qt::SizeHorCursor); break;
         default: setCursor(Qt::ArrowCursor); break;
         }
-    } else if (shapeAt(pos)) {
+        return;
+    }
+
+    // Проверяем попадание на фигуру
+    if (shapeAt(pos)) {
         setCursor(Qt::SizeAllCursor);
+        return;
+    }
+
+    // По умолчанию ставим курсор в зависимости от инструмента
+    if (currentTool == Tool::Draw) {
+        setCursor(Qt::CrossCursor);
     } else {
-        // В режиме Select над пустым местом - обычная стрелка
         setCursor(Qt::ArrowCursor);
     }
+}
+
+/**
+ * @brief Рисует фон сетки (линиями).
+ */
+void Canvas::drawGrid(QPainter* p) {
+    if (gridSize <= 0) return;
+
+    // Сетка стала бледнее
+    QPen pen(QColor(240, 240, 240), 1, Qt::SolidLine); // Используем сплошную линию
+    p->setPen(pen);
+
+    int w = width();
+    int h = height();
+
+    for (int x = 0; x < w; x += gridSize) {
+        p->drawLine(x, 0, x, h);
+    }
+    for (int y = 0; y < h; y += gridSize) {
+        p->drawLine(0, y, w, y);
+    }
+}
+
+/**
+ * @brief Привязывает точку к ближайшему узлу сетки.
+ */
+QPoint Canvas::snapToGrid(const QPoint& pos) {
+    if (!snapEnabled || gridSize <= 0) {
+        return pos; // Привязка выключена, возвращаем как есть
+    }
+
+    // qRound математически округляет к ближайшему целому
+    int snappedX = qRound(pos.x() / (double)gridSize) * gridSize;
+    int snappedY = qRound(pos.y() / (double)gridSize) * gridSize;
+
+    return QPoint(snappedX, snappedY);
 }

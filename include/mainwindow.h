@@ -5,6 +5,7 @@
 #include <QMainWindow>
 #include <QPushButton>
 #include <QVBoxLayout>
+#include <QCheckBox>
 #include "canvas.h"
 
 class MainWindow : public QMainWindow {
@@ -19,6 +20,8 @@ private:
     QPushButton *btnLine;
     QPushButton *btnRect;
     QPushButton *btnCircle;
+    QCheckBox *chkGrid;
+    QCheckBox *chkSnap;
 };
 
 #endif // MAINWINDOW_H
